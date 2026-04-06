@@ -1,10 +1,7 @@
 {
-  "name": "blockverse-server",
+  "name": "blockverse-signal",
   "version": "1.0.0",
-  "dependencies": {
-    "ws": "^8.14.2"
-  },
-  "scripts": {
-    "start": "node server.js"
-  }
+  "main": "signal-server.js",
+  "scripts": { "start": "node signal-server.js" },
+  "dependencies": { "ws": "^8.14.2" }
 }
