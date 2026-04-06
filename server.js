@@ -1,137 +1,103 @@
 const WebSocket = require('ws');
-const http = require('http');
+const server = new WebSocket.Server({ port: process.env.PORT || 8080 });
 
-const server = http.createServer();
-const wss = new WebSocket.Server({ server });
+let games = new Map();
+let clients = new Map();
 
-// Хранилище игр (комнат)
-const games = new Map();
-
-function generateGameId() {
-    return Math.random().toString(36).substring(2, 8);
-}
-
-wss.on('connection', (ws) => {
-    let currentGame = null;
-    let playerId = null;
+server.on('connection', (ws, req) => {
+    const clientId = Date.now() + '-' + Math.random().toString(36).substr(2, 8);
+    clients.set(clientId, ws);
+    console.log(`Client ${clientId} connected`);
 
     ws.on('message', (message) => {
-        const data = JSON.parse(message);
-        
-        switch (data.type) {
-            case 'create_game':
-                const gameId = generateGameId();
-                const gameData = data.gameData;
-                games.set(gameId, {
-                    id: gameId,
-                    name: data.gameName,
-                    author: data.author,
-                    gameData: gameData,
-                    players: new Map(),
-                    nextPlayerId: 1,
-                    createdAt: Date.now()
-                });
-                ws.send(JSON.stringify({ type: 'game_created', gameId, gameName: data.gameName }));
-                break;
-
-            case 'join_game':
-                const game = games.get(data.gameId);
-                if (!game) {
-                    ws.send(JSON.stringify({ type: 'error', message: 'Game not found' }));
-                    return;
-                }
-                currentGame = game;
-                playerId = game.nextPlayerId++;
-                game.players.set(playerId, {
-                    ws: ws,
-                    position: { x: 0, y: 1, z: 0 },
-                    rotation: { yaw: 0, pitch: 0 }
-                });
-                ws.send(JSON.stringify({ type: 'joined', playerId, gameData: game.gameData, gameName: game.name, players: Array.from(game.players.keys()) }));
-                // Уведомляем всех в комнате о новом игроке
-                game.players.forEach((player, id) => {
-                    if (id !== playerId && player.ws.readyState === WebSocket.OPEN) {
-                        player.ws.send(JSON.stringify({ type: 'player_joined', playerId, position: { x: 0, y: 1, z: 0 } }));
+        try {
+            const data = JSON.parse(message);
+            
+            switch (data.type) {
+                case 'get_games_list':
+                    const gamesList = Array.from(games.entries()).map(([id, game]) => ({
+                        id: id,
+                        name: game.name,
+                        author: game.author,
+                        players: game.players.size
+                    }));
+                    ws.send(JSON.stringify({ type: 'games_list', games: gamesList }));
+                    break;
+                    
+                case 'create_game':
+                    const gameId = Date.now() + '-' + Math.random().toString(36).substr(2, 8);
+                    const game = {
+                        name: data.gameName,
+                        author: data.author,
+                        gameData: data.gameData,
+                        players: new Map([[clientId, ws]])
+                    };
+                    games.set(gameId, game);
+                    ws.send(JSON.stringify({ type: 'game_created', gameId: gameId, gameName: data.gameName }));
+                    ws.send(JSON.stringify({ type: 'joined', playerId: clientId, gameData: data.gameData, gameName: data.gameName }));
+                    break;
+                    
+                case 'join_game':
+                    const targetGame = games.get(data.gameId);
+                    if (targetGame) {
+                        targetGame.players.set(clientId, ws);
+                        ws.send(JSON.stringify({ type: 'joined', playerId: clientId, gameData: targetGame.gameData, gameName: targetGame.name }));
+                        targetGame.players.forEach((playerWs, playerId) => {
+                            if (playerId !== clientId) {
+                                playerWs.send(JSON.stringify({ type: 'player_joined', playerId: clientId, position: { x: 0, y: 1, z: 0 } }));
+                                ws.send(JSON.stringify({ type: 'player_joined', playerId: playerId, position: { x: 0, y: 1, z: 0 } }));
+                            }
+                        });
+                    } else {
+                        ws.send(JSON.stringify({ type: 'error', message: 'Game not found' }));
                     }
-                });
-                // Обновляем список игр для всех клиентов (изменение количества игроков)
-                broadcastGameList();
-                break;
-
-            case 'update_position':
-                if (!currentGame) return;
-                const player = currentGame.players.get(playerId);
-                if (player) {
-                    player.position = data.position;
-                    currentGame.players.forEach((p, id) => {
-                        if (id !== playerId && p.ws.readyState === WebSocket.OPEN) {
-                            p.ws.send(JSON.stringify({ type: 'player_moved', playerId, position: data.position }));
+                    break;
+                    
+                case 'update_position':
+                    for (let [gid, gameRoom] of games) {
+                        if (gameRoom.players.has(clientId)) {
+                            gameRoom.players.forEach((playerWs, playerId) => {
+                                if (playerId !== clientId) {
+                                    playerWs.send(JSON.stringify({ type: 'player_moved', playerId: clientId, position: data.position }));
+                                }
+                            });
+                            break;
                         }
-                    });
-                }
-                break;
-
-            case 'leave_game':
-                if (currentGame) {
-                    currentGame.players.delete(playerId);
-                    currentGame.players.forEach((p) => {
-                        if (p.ws.readyState === WebSocket.OPEN) {
-                            p.ws.send(JSON.stringify({ type: 'player_left', playerId }));
-                        }
-                    });
-                    if (currentGame.players.size === 0) {
-                        games.delete(currentGame.id);
                     }
-                    broadcastGameList();
-                }
-                currentGame = null;
-                playerId = null;
-                break;
-
-            case 'get_games_list':
-                const gamesList = Array.from(games.values()).map(g => ({
-                    id: g.id,
-                    name: g.name,
-                    author: g.author,
-                    players: g.players.size,
-                    createdAt: g.createdAt
-                }));
-                ws.send(JSON.stringify({ type: 'games_list', games: gamesList }));
-                break;
-        }
-    });
-
-    ws.on('close', () => {
-        if (currentGame) {
-            currentGame.players.delete(playerId);
-            currentGame.players.forEach((p) => {
-                if (p.ws.readyState === WebSocket.OPEN) {
-                    p.ws.send(JSON.stringify({ type: 'player_left', playerId }));
-                }
-            });
-            if (currentGame.players.size === 0) {
-                games.delete(currentGame.id);
+                    break;
+                    
+                case 'leave_game':
+                    for (let [gid, gameRoom] of games) {
+                        if (gameRoom.players.has(clientId)) {
+                            gameRoom.players.delete(clientId);
+                            gameRoom.players.forEach((playerWs) => {
+                                playerWs.send(JSON.stringify({ type: 'player_left', playerId: clientId }));
+                            });
+                            if (gameRoom.players.size === 0) {
+                                games.delete(gid);
+                            }
+                            break;
+                        }
+                    }
+                    break;
             }
-            broadcastGameList();
+        } catch(e) { console.error('Message error:', e); }
+    });
+    
+    ws.on('close', () => {
+        console.log(`Client ${clientId} disconnected`);
+        for (let [gid, gameRoom] of games) {
+            if (gameRoom.players.has(clientId)) {
+                gameRoom.players.delete(clientId);
+                gameRoom.players.forEach((playerWs) => {
+                    playerWs.send(JSON.stringify({ type: 'player_left', playerId: clientId }));
+                });
+                if (gameRoom.players.size === 0) games.delete(gid);
+                break;
+            }
         }
+        clients.delete(clientId);
     });
 });
 
-function broadcastGameList() {
-    const gamesList = Array.from(games.values()).map(g => ({
-        id: g.id,
-        name: g.name,
-        author: g.author,
-        players: g.players.size,
-        createdAt: g.createdAt
-    }));
-    wss.clients.forEach(client => {
-        if (client.readyState === WebSocket.OPEN) {
-            client.send(JSON.stringify({ type: 'games_list', games: gamesList }));
-        }
-    });
-}
-
-server.listen(process.env.PORT || 3000, () => {
-    console.log(`WebSocket server running on port ${process.env.PORT || 3000}`);
-});
+console.log(`Signal server running on port ${process.env.PORT || 8080}`);
