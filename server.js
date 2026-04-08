@@ -2,8 +2,7 @@ const WebSocket = require('ws');
 
 const server = new WebSocket.Server({ port: process.env.PORT || 8080 });
 
-// Хранилище комнат
-let rooms = new Map(); // roomId -> { name, author, gameData, players: Map(playerId -> ws), createdAt }
+let rooms = new Map();
 
 server.on('connection', (ws) => {
     const playerId = Math.random().toString(36).substring(2, 10) + Date.now().toString(36);
@@ -14,10 +13,8 @@ server.on('connection', (ws) => {
     ws.on('message', (rawMessage) => {
         try {
             const data = JSON.parse(rawMessage);
-            console.log(`📨 ${data.type} от ${playerId}`);
             
             switch (data.type) {
-                // ========== ПОЛУЧИТЬ СПИСОК КОМНАТ ==========
                 case 'get_rooms':
                     const roomsList = Array.from(rooms.entries()).map(([id, room]) => ({
                         id: id,
@@ -28,7 +25,6 @@ server.on('connection', (ws) => {
                     ws.send(JSON.stringify({ type: 'rooms_list', rooms: roomsList }));
                     break;
                 
-                // ========== СОЗДАТЬ КОМНАТУ ==========
                 case 'create_room':
                     const roomId = Math.random().toString(36).substring(2, 10) + Date.now().toString(36);
                     currentRoomId = roomId;
@@ -37,8 +33,7 @@ server.on('connection', (ws) => {
                         name: data.roomName,
                         author: data.author,
                         gameData: data.gameData,
-                        players: new Map([[playerId, ws]]),
-                        createdAt: Date.now()
+                        players: new Map([[playerId, ws]])
                     });
                     
                     ws.send(JSON.stringify({
@@ -58,7 +53,6 @@ server.on('connection', (ws) => {
                     console.log(`🎮 Комната "${data.roomName}" создана (${roomId})`);
                     break;
                 
-                // ========== ВОЙТИ В КОМНАТУ ==========
                 case 'join_room':
                     const room = rooms.get(data.roomId);
                     
@@ -70,7 +64,6 @@ server.on('connection', (ws) => {
                     currentRoomId = data.roomId;
                     room.players.set(playerId, ws);
                     
-                    // Отправляем новому игроку информацию о комнате
                     const existingPlayers = Array.from(room.players.entries()).map(([pid, pws]) => ({
                         id: pid,
                         position: { x: 0, y: 1.5, z: 0 }
@@ -84,9 +77,8 @@ server.on('connection', (ws) => {
                         players: existingPlayers
                     }));
                     
-                    // Уведомляем остальных игроков о новом
                     room.players.forEach((playerWs, pid) => {
-                        if (pid !== playerId && playerWs.readyState === WebSocket.OPEN) {
+                        if (pid !== playerId) {
                             playerWs.send(JSON.stringify({
                                 type: 'player_joined',
                                 playerId: playerId,
@@ -98,7 +90,6 @@ server.on('connection', (ws) => {
                     console.log(`👋 Игрок ${playerId} вошёл в комнату ${data.roomId} (${room.players.size} игроков)`);
                     break;
                 
-                // ========== ОБНОВИТЬ ПОЗИЦИЮ ==========
                 case 'update_position':
                     if (currentRoomId) {
                         const currentRoom = rooms.get(currentRoomId);
@@ -116,7 +107,6 @@ server.on('connection', (ws) => {
                     }
                     break;
                 
-                // ========== ВЫЙТИ ИЗ КОМНАТЫ ==========
                 case 'leave_room':
                     if (currentRoomId) {
                         const currentRoom = rooms.get(currentRoomId);
@@ -124,17 +114,15 @@ server.on('connection', (ws) => {
                             currentRoom.players.delete(playerId);
                             
                             currentRoom.players.forEach((playerWs) => {
-                                if (playerWs.readyState === WebSocket.OPEN) {
-                                    playerWs.send(JSON.stringify({
-                                        type: 'player_left',
-                                        playerId: playerId
-                                    }));
-                                }
+                                playerWs.send(JSON.stringify({
+                                    type: 'player_left',
+                                    playerId: playerId
+                                }));
                             });
                             
                             if (currentRoom.players.size === 0) {
                                 rooms.delete(currentRoomId);
-                                console.log(`🗑️ Комната ${currentRoomId} удалена (пуста)`);
+                                console.log(`🗑️ Комната ${currentRoomId} удалена`);
                             }
                         }
                         currentRoomId = null;
@@ -142,28 +130,23 @@ server.on('connection', (ws) => {
                     break;
             }
         } catch (err) {
-            console.error('Ошибка обработки:', err);
+            console.error('Ошибка:', err);
         }
     });
     
     ws.on('close', () => {
         console.log(`❌ Игрок ${playerId} отключился`);
-        
         if (currentRoomId) {
             const room = rooms.get(currentRoomId);
             if (room) {
                 room.players.delete(playerId);
                 room.players.forEach((playerWs) => {
-                    if (playerWs.readyState === WebSocket.OPEN) {
-                        playerWs.send(JSON.stringify({ type: 'player_left', playerId: playerId }));
-                    }
+                    playerWs.send(JSON.stringify({ type: 'player_left', playerId: playerId }));
                 });
-                if (room.players.size === 0) {
-                    rooms.delete(currentRoomId);
-                }
+                if (room.players.size === 0) rooms.delete(currentRoomId);
             }
         }
     });
 });
 
-console.log(`🚀 Сигнальный сервер запущен на порту ${process.env.PORT || 8080}`);
+console.log(`🚀 Сигнальный сервер на порту ${process.env.PORT || 8080}`);
