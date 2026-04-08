@@ -3,12 +3,13 @@ const WebSocket = require('ws');
 const server = new WebSocket.Server({ port: process.env.PORT || 8080 });
 
 let rooms = new Map();
+let players = new Map();
 
 server.on('connection', (ws) => {
     const playerId = Math.random().toString(36).substring(2, 10) + Date.now().toString(36);
-    let currentRoomId = null;
+    players.set(playerId, { ws, roomId: null });
     
-    console.log(`✅ Игрок ${playerId} подключился`);
+    console.log(`✅ Игрок ${playerId} подключился (всего: ${players.size})`);
 
     ws.on('message', (rawMessage) => {
         try {
@@ -27,14 +28,17 @@ server.on('connection', (ws) => {
                 
                 case 'create_room':
                     const roomId = Math.random().toString(36).substring(2, 10) + Date.now().toString(36);
-                    currentRoomId = roomId;
                     
                     rooms.set(roomId, {
+                        id: roomId,
                         name: data.roomName,
                         author: data.author,
                         gameData: data.gameData,
-                        players: new Map([[playerId, ws]])
+                        players: new Map([[playerId, ws]]),
+                        createdAt: Date.now()
                     });
+                    
+                    players.get(playerId).roomId = roomId;
                     
                     ws.send(JSON.stringify({
                         type: 'room_created',
@@ -47,7 +51,7 @@ server.on('connection', (ws) => {
                         playerId: playerId,
                         roomId: roomId,
                         gameData: data.gameData,
-                        players: [{ id: playerId, position: { x: 0, y: 1.5, z: 0 } }]
+                        players: [{ id: playerId, position: { x: 0, y: 1.5, z: 0 }, name: data.author }]
                     }));
                     
                     console.log(`🎮 Комната "${data.roomName}" создана (${roomId})`);
@@ -55,18 +59,18 @@ server.on('connection', (ws) => {
                 
                 case 'join_room':
                     const room = rooms.get(data.roomId);
-                    
                     if (!room) {
                         ws.send(JSON.stringify({ type: 'error', message: 'Комната не найдена' }));
                         return;
                     }
                     
-                    currentRoomId = data.roomId;
+                    players.get(playerId).roomId = data.roomId;
                     room.players.set(playerId, ws);
                     
                     const existingPlayers = Array.from(room.players.entries()).map(([pid, pws]) => ({
                         id: pid,
-                        position: { x: 0, y: 1.5, z: 0 }
+                        position: { x: 0, y: 1.5, z: 0 },
+                        name: players.get(pid)?.name || 'Игрок'
                     }));
                     
                     ws.send(JSON.stringify({
@@ -82,7 +86,8 @@ server.on('connection', (ws) => {
                             playerWs.send(JSON.stringify({
                                 type: 'player_joined',
                                 playerId: playerId,
-                                position: { x: 0, y: 1.5, z: 0 }
+                                position: { x: 0, y: 1.5, z: 0 },
+                                name: players.get(playerId)?.name || 'Игрок'
                             }));
                         }
                     });
@@ -91,42 +96,38 @@ server.on('connection', (ws) => {
                     break;
                 
                 case 'update_position':
-                    if (currentRoomId) {
-                        const currentRoom = rooms.get(currentRoomId);
-                        if (currentRoom) {
-                            currentRoom.players.forEach((playerWs, pid) => {
-                                if (pid !== playerId && playerWs.readyState === WebSocket.OPEN) {
-                                    playerWs.send(JSON.stringify({
-                                        type: 'player_moved',
-                                        playerId: playerId,
-                                        position: data.position
-                                    }));
-                                }
-                            });
-                        }
+                    const currentRoom = rooms.get(players.get(playerId)?.roomId);
+                    if (currentRoom) {
+                        currentRoom.players.forEach((playerWs, pid) => {
+                            if (pid !== playerId && playerWs.readyState === WebSocket.OPEN) {
+                                playerWs.send(JSON.stringify({
+                                    type: 'player_moved',
+                                    playerId: playerId,
+                                    position: data.position
+                                }));
+                            }
+                        });
                     }
                     break;
                 
                 case 'leave_room':
-                    if (currentRoomId) {
-                        const currentRoom = rooms.get(currentRoomId);
-                        if (currentRoom) {
-                            currentRoom.players.delete(playerId);
-                            
-                            currentRoom.players.forEach((playerWs) => {
+                    const playerRoom = rooms.get(players.get(playerId)?.roomId);
+                    if (playerRoom) {
+                        playerRoom.players.delete(playerId);
+                        playerRoom.players.forEach((playerWs) => {
+                            if (playerWs.readyState === WebSocket.OPEN) {
                                 playerWs.send(JSON.stringify({
                                     type: 'player_left',
                                     playerId: playerId
                                 }));
-                            });
-                            
-                            if (currentRoom.players.size === 0) {
-                                rooms.delete(currentRoomId);
-                                console.log(`🗑️ Комната ${currentRoomId} удалена`);
                             }
+                        });
+                        if (playerRoom.players.size === 0) {
+                            rooms.delete(playerRoom.id);
+                            console.log(`🗑️ Комната ${playerRoom.id} удалена`);
                         }
-                        currentRoomId = null;
                     }
+                    players.get(playerId).roomId = null;
                     break;
             }
         } catch (err) {
@@ -136,16 +137,22 @@ server.on('connection', (ws) => {
     
     ws.on('close', () => {
         console.log(`❌ Игрок ${playerId} отключился`);
-        if (currentRoomId) {
-            const room = rooms.get(currentRoomId);
+        const player = players.get(playerId);
+        if (player && player.roomId) {
+            const room = rooms.get(player.roomId);
             if (room) {
                 room.players.delete(playerId);
                 room.players.forEach((playerWs) => {
-                    playerWs.send(JSON.stringify({ type: 'player_left', playerId: playerId }));
+                    if (playerWs.readyState === WebSocket.OPEN) {
+                        playerWs.send(JSON.stringify({ type: 'player_left', playerId: playerId }));
+                    }
                 });
-                if (room.players.size === 0) rooms.delete(currentRoomId);
+                if (room.players.size === 0) {
+                    rooms.delete(room.id);
+                }
             }
         }
+        players.delete(playerId);
     });
 });
 
