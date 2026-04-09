@@ -2,158 +2,192 @@ const WebSocket = require('ws');
 
 const server = new WebSocket.Server({ port: process.env.PORT || 8080 });
 
-let rooms = new Map();
-let players = new Map();
+// Хранилище игр (опубликованные игры)
+let games = new Map(); // gameId -> { name, author, gameData, publishedAt, servers: [] }
+
+// Хранилище серверов (активные экземпляры игр)
+let servers = new Map(); // serverId -> { gameId, region, players: Map(playerId -> ws), createdAt, lastActivity }
+
+const REGIONS = ['europe', 'asia', 'america'];
 
 server.on('connection', (ws) => {
     const playerId = Math.random().toString(36).substring(2, 10) + Date.now().toString(36);
-    players.set(playerId, { ws, roomId: null });
+    let currentServerId = null;
     
-    console.log(`✅ Игрок ${playerId} подключился (всего: ${players.size})`);
+    console.log(`✅ Игрок ${playerId} подключился`);
 
     ws.on('message', (rawMessage) => {
         try {
             const data = JSON.parse(rawMessage);
             
             switch (data.type) {
-                case 'get_rooms':
-                    const roomsList = Array.from(rooms.entries()).map(([id, room]) => ({
+                // ========== ПОЛУЧИТЬ СПИСОК ОПУБЛИКОВАННЫХ ИГР ==========
+                case 'get_published_games':
+                    const gamesList = Array.from(games.entries()).map(([id, game]) => ({
                         id: id,
-                        name: room.name,
-                        author: room.author,
-                        players: room.players.size
+                        name: game.name,
+                        author: game.author,
+                        publishedAt: game.publishedAt,
+                        activeServers: game.servers.filter(sid => servers.has(sid)).length
                     }));
-                    ws.send(JSON.stringify({ type: 'rooms_list', rooms: roomsList }));
+                    ws.send(JSON.stringify({ type: 'published_games', games: gamesList }));
                     break;
                 
-                case 'create_room':
-                    const roomId = Math.random().toString(36).substring(2, 10) + Date.now().toString(36);
-                    
-                    rooms.set(roomId, {
-                        id: roomId,
-                        name: data.roomName,
+                // ========== ОПУБЛИКОВАТЬ НОВУЮ ИГРУ ==========
+                case 'publish_game':
+                    const gameId = Date.now().toString(36) + Math.random().toString(36).substr(2, 8);
+                    games.set(gameId, {
+                        name: data.gameName,
                         author: data.author,
                         gameData: data.gameData,
-                        players: new Map([[playerId, ws]]),
-                        createdAt: Date.now()
+                        publishedAt: Date.now(),
+                        servers: []
                     });
-                    
-                    players.get(playerId).roomId = roomId;
-                    
-                    ws.send(JSON.stringify({
-                        type: 'room_created',
-                        roomId: roomId,
-                        roomName: data.roomName
-                    }));
-                    
-                    ws.send(JSON.stringify({
-                        type: 'joined_room',
-                        playerId: playerId,
-                        roomId: roomId,
-                        gameData: data.gameData,
-                        players: [{ id: playerId, position: { x: 0, y: 1.5, z: 0 }, name: data.author }]
-                    }));
-                    
-                    console.log(`🎮 Комната "${data.roomName}" создана (${roomId})`);
+                    ws.send(JSON.stringify({ type: 'game_published', gameId: gameId, gameName: data.gameName }));
+                    console.log(`📢 Игра "${data.gameName}" опубликована (${gameId})`);
                     break;
                 
-                case 'join_room':
-                    const room = rooms.get(data.roomId);
-                    if (!room) {
-                        ws.send(JSON.stringify({ type: 'error', message: 'Комната не найдена' }));
+                // ========== ЗАПУСТИТЬ ИГРУ (СОЗДАТЬ/НАЙТИ СЕРВЕР) ==========
+                case 'play_game':
+                    const game = games.get(data.gameId);
+                    if (!game) {
+                        ws.send(JSON.stringify({ type: 'error', message: 'Игра не найдена' }));
                         return;
                     }
                     
-                    players.get(playerId).roomId = data.roomId;
-                    room.players.set(playerId, ws);
+                    // Ищем активный сервер этой игры в регионе игрока
+                    let availableServer = null;
+                    for (let [sid, server] of servers) {
+                        if (server.gameId === data.gameId && 
+                            server.region === data.playerRegion && 
+                            server.players.size < 50 &&
+                            server.isActive !== false) {
+                            availableServer = sid;
+                            break;
+                        }
+                    }
                     
-                    const existingPlayers = Array.from(room.players.entries()).map(([pid, pws]) => ({
-                        id: pid,
-                        position: { x: 0, y: 1.5, z: 0 },
-                        name: players.get(pid)?.name || 'Игрок'
-                    }));
+                    // Если нет сервера в регионе, ищем в других регионах
+                    if (!availableServer) {
+                        for (let [sid, server] of servers) {
+                            if (server.gameId === data.gameId && server.players.size < 50 && server.isActive !== false) {
+                                availableServer = sid;
+                                break;
+                            }
+                        }
+                    }
+                    
+                    let serverId;
+                    if (availableServer) {
+                        // Подключаемся к существующему серверу
+                        serverId = availableServer;
+                        console.log(`🔗 Игрок ${playerId} подключён к существующему серверу ${serverId}`);
+                    } else {
+                        // Создаём новый сервер
+                        serverId = Date.now().toString(36) + Math.random().toString(36).substr(2, 8);
+                        servers.set(serverId, {
+                            gameId: data.gameId,
+                            region: data.playerRegion,
+                            players: new Map(),
+                            createdAt: Date.now(),
+                            lastActivity: Date.now(),
+                            isActive: true
+                        });
+                        game.servers.push(serverId);
+                        console.log(`🆕 Создан новый сервер ${serverId} для игры "${game.name}" в регионе ${data.playerRegion}`);
+                    }
+                    
+                    currentServerId = serverId;
+                    const targetServer = servers.get(serverId);
+                    targetServer.players.set(playerId, ws);
+                    targetServer.lastActivity = Date.now();
                     
                     ws.send(JSON.stringify({
-                        type: 'joined_room',
-                        playerId: playerId,
-                        roomId: data.roomId,
-                        gameData: room.gameData,
-                        players: existingPlayers
+                        type: 'game_started',
+                        serverId: serverId,
+                        gameData: game.gameData,
+                        players: Array.from(targetServer.players.entries()).map(([pid, pws]) => ({
+                            id: pid,
+                            position: { x: 0, y: 1.5, z: 0 },
+                            name: `Player_${pid.substring(0, 6)}`
+                        }))
                     }));
-                    
-                    room.players.forEach((playerWs, pid) => {
-                        if (pid !== playerId) {
-                            playerWs.send(JSON.stringify({
-                                type: 'player_joined',
-                                playerId: playerId,
-                                position: { x: 0, y: 1.5, z: 0 },
-                                name: players.get(playerId)?.name || 'Игрок'
-                            }));
-                        }
-                    });
-                    
-                    console.log(`👋 Игрок ${playerId} вошёл в комнату ${data.roomId} (${room.players.size} игроков)`);
                     break;
                 
+                // ========== ОБНОВИТЬ ПОЗИЦИЮ ==========
                 case 'update_position':
-                    const currentRoom = rooms.get(players.get(playerId)?.roomId);
-                    if (currentRoom) {
-                        currentRoom.players.forEach((playerWs, pid) => {
-                            if (pid !== playerId && playerWs.readyState === WebSocket.OPEN) {
-                                playerWs.send(JSON.stringify({
-                                    type: 'player_moved',
-                                    playerId: playerId,
-                                    position: data.position
-                                }));
-                            }
-                        });
+                    if (currentServerId) {
+                        const server = servers.get(currentServerId);
+                        if (server) {
+                            server.lastActivity = Date.now();
+                            server.players.forEach((playerWs, pid) => {
+                                if (pid !== playerId && playerWs.readyState === WebSocket.OPEN) {
+                                    playerWs.send(JSON.stringify({
+                                        type: 'player_moved',
+                                        playerId: playerId,
+                                        position: data.position
+                                    }));
+                                }
+                            });
+                        }
                     }
                     break;
                 
-                case 'leave_room':
-                    const playerRoom = rooms.get(players.get(playerId)?.roomId);
-                    if (playerRoom) {
-                        playerRoom.players.delete(playerId);
-                        playerRoom.players.forEach((playerWs) => {
-                            if (playerWs.readyState === WebSocket.OPEN) {
-                                playerWs.send(JSON.stringify({
-                                    type: 'player_left',
-                                    playerId: playerId
-                                }));
+                // ========== ВЫЙТИ ИЗ ИГРЫ ==========
+                case 'leave_game':
+                    if (currentServerId) {
+                        const server = servers.get(currentServerId);
+                        if (server) {
+                            server.players.delete(playerId);
+                            server.players.forEach((playerWs) => {
+                                if (playerWs.readyState === WebSocket.OPEN) {
+                                    playerWs.send(JSON.stringify({
+                                        type: 'player_left',
+                                        playerId: playerId
+                                    }));
+                                }
+                            });
+                            
+                            if (server.players.size === 0) {
+                                // Сервер пуст, удаляем
+                                servers.delete(currentServerId);
+                                const game = games.get(server.gameId);
+                                if (game) {
+                                    const idx = game.servers.indexOf(currentServerId);
+                                    if (idx !== -1) game.servers.splice(idx, 1);
+                                }
+                                console.log(`💤 Сервер ${currentServerId} удалён (пуст)`);
                             }
-                        });
-                        if (playerRoom.players.size === 0) {
-                            rooms.delete(playerRoom.id);
-                            console.log(`🗑️ Комната ${playerRoom.id} удалена`);
                         }
+                        currentServerId = null;
                     }
-                    players.get(playerId).roomId = null;
                     break;
             }
         } catch (err) {
-            console.error('Ошибка:', err);
+            console.error('Ошибка обработки:', err);
         }
     });
     
     ws.on('close', () => {
         console.log(`❌ Игрок ${playerId} отключился`);
-        const player = players.get(playerId);
-        if (player && player.roomId) {
-            const room = rooms.get(player.roomId);
-            if (room) {
-                room.players.delete(playerId);
-                room.players.forEach((playerWs) => {
-                    if (playerWs.readyState === WebSocket.OPEN) {
-                        playerWs.send(JSON.stringify({ type: 'player_left', playerId: playerId }));
+        
+        if (currentServerId) {
+            const server = servers.get(currentServerId);
+            if (server) {
+                server.players.delete(playerId);
+                if (server.players.size === 0) {
+                    servers.delete(currentServerId);
+                    const game = games.get(server.gameId);
+                    if (game) {
+                        const idx = game.servers.indexOf(currentServerId);
+                        if (idx !== -1) game.servers.splice(idx, 1);
                     }
-                });
-                if (room.players.size === 0) {
-                    rooms.delete(room.id);
+                    console.log(`💤 Сервер ${currentServerId} удалён (игрок отключился)`);
                 }
             }
         }
-        players.delete(playerId);
     });
 });
 
-console.log(`🚀 Сигнальный сервер на порту ${process.env.PORT || 8080}`);
+console.log(`🚀 Сигнальный сервер запущен на порту ${process.env.PORT || 8080}`);
+console.log(`📍 Режим: игры публикуются, сервера создаются автоматически`);
