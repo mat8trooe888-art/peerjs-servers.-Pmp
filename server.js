@@ -1,7 +1,35 @@
 const WebSocket = require('ws');
+const redis = require('redis');
+
+// Подключаем Redis (если не указан, работаем без него)
+const useRedis = process.env.REDIS_URL ? true : false;
+let publisher, subscriber;
+if (useRedis) {
+    publisher = redis.createClient({ url: process.env.REDIS_URL });
+    subscriber = publisher.duplicate();
+    publisher.on('error', (err) => console.error('Redis Pub Error:', err));
+    subscriber.on('error', (err) => console.error('Redis Sub Error:', err));
+    Promise.all([publisher.connect(), subscriber.connect()]).then(() => {
+        console.log('✅ Redis подключён');
+        subscriber.subscribe('blockverse:rooms', (message) => {
+            const data = JSON.parse(message);
+            // Обработка событий от других инстансов
+            if (data.type === 'room_update') {
+                // Обновить локальный кэш комнат
+            }
+        });
+    });
+}
+
 const server = new WebSocket.Server({ port: process.env.PORT || 8080 });
 
-let rooms = new Map();
+let rooms = new Map(); // локальный кэш (без Redis) или глобальный через Redis
+
+function broadcastRoomUpdate() {
+    if (useRedis) {
+        publisher.publish('blockverse:rooms', JSON.stringify({ type: 'room_update', rooms: Array.from(rooms.entries()) }));
+    }
+}
 
 server.on('connection', (ws) => {
     const playerId = Math.random().toString(36).substring(2, 10) + Date.now().toString(36);
@@ -33,6 +61,7 @@ server.on('connection', (ws) => {
                         type: 'joined_room', playerId, roomId, gameData: data.gameData,
                         players: [{ id: playerId, position: { x:0, y:1.5, z:0 } }]
                     }));
+                    broadcastRoomUpdate();
                     console.log(`🎮 Комната "${data.roomName}" создана (${roomId})`);
                     break;
                 case 'join_room':
@@ -79,6 +108,7 @@ server.on('connection', (ws) => {
                             });
                             if (currentRoom.players.size === 0) {
                                 rooms.delete(currentRoomId);
+                                broadcastRoomUpdate();
                                 console.log(`🗑️ Комната ${currentRoomId} удалена`);
                             }
                         }
@@ -100,12 +130,15 @@ server.on('connection', (ws) => {
                         playerWs.send(JSON.stringify({ type: 'player_left', playerId }));
                     }
                 });
-                if (room.players.size === 0) rooms.delete(currentRoomId);
+                if (room.players.size === 0) {
+                    rooms.delete(currentRoomId);
+                    broadcastRoomUpdate();
+                }
             }
         }
     });
 
-    ws.on('error', (err) => console.error(`Ошибка игрока ${playerId}:`, err));
+    ws.on('error', (err) => console.error(`Ошибка WebSocket игрока ${playerId}:`, err));
 });
 
 const interval = setInterval(() => {
@@ -117,4 +150,4 @@ const interval = setInterval(() => {
 }, 30000);
 server.on('close', () => clearInterval(interval));
 
-console.log(`🚀 Сигнальный сервер на порту ${process.env.PORT || 8080}`);
+console.log(`🚀 Сигнальный сервер на порту ${process.env.PORT || 8080} ${useRedis ? 'с Redis' : '(без Redis)'}`);
