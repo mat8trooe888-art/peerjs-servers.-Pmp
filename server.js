@@ -1,171 +1,123 @@
 const WebSocket = require('ws');
+const port = process.env.PORT || 8080;
+const wss = new WebSocket.Server({ port });
 
-const server = new WebSocket.Server({ port: process.env.PORT || 8080 });
+const rooms = new Map();
 
-let rooms = new Map();
-
-function heartbeat() { this.isAlive = true; }
-
-server.on('connection', (ws) => {
-    const playerId = Math.random().toString(36).substring(2, 10) + Date.now().toString(36);
-    let currentRoomId = null;
-    ws.isAlive = true;
-    ws.on('pong', heartbeat);
-
-    console.log(`✅ Игрок ${playerId} подключился`);
-
-    ws.on('message', (rawMessage) => {
+wss.on('connection', (ws) => {
+    ws.on('message', (message) => {
         try {
-            const data = JSON.parse(rawMessage);
+            const data = JSON.parse(message);
             
             switch (data.type) {
-                case 'ping':
-                    ws.send(JSON.stringify({ type: 'pong' }));
-                    break;
-                    
-                case 'get_rooms':
-                    const roomsList = Array.from(rooms.entries()).map(([id, room]) => ({
-                        id: id,
-                        name: room.name,
-                        author: room.author,
-                        players: room.players.size
-                    }));
-                    ws.send(JSON.stringify({ type: 'rooms_list', rooms: roomsList }));
-                    break;
-                
                 case 'create_room':
-                    const roomId = Math.random().toString(36).substring(2, 10) + Date.now().toString(36);
-                    currentRoomId = roomId;
-                    
+                    const roomId = data.roomName;
                     rooms.set(roomId, {
-                        name: data.roomName,
+                        id: roomId,
                         author: data.author,
                         gameData: data.gameData,
-                        players: new Map([[playerId, ws]])
+                        players: new Map()
                     });
-                    
-                    ws.send(JSON.stringify({
-                        type: 'room_created',
-                        roomId: roomId,
-                        roomName: data.roomName
-                    }));
-                    
-                    ws.send(JSON.stringify({
-                        type: 'joined_room',
-                        playerId: playerId,
-                        roomId: roomId,
-                        gameData: data.gameData,
-                        players: [{ id: playerId, position: { x: 0, y: 1.5, z: 0 } }]
-                    }));
-                    
-                    console.log(`🎮 Комната "${data.roomName}" создана (${roomId})`);
+                    // После создания сразу заходим в неё
+                    joinRoom(ws, roomId);
                     break;
-                
+                    
                 case 'join_room':
-                    const room = rooms.get(data.roomId);
-                    if (!room) {
-                        ws.send(JSON.stringify({ type: 'error', message: 'Комната не найдена' }));
-                        return;
-                    }
-                    
-                    currentRoomId = data.roomId;
-                    room.players.set(playerId, ws);
-                    
-                    const existingPlayers = Array.from(room.players.entries()).map(([pid]) => ({
-                        id: pid,
-                        position: { x: 0, y: 1.5, z: 0 }
-                    }));
-                    
-                    ws.send(JSON.stringify({
-                        type: 'joined_room',
-                        playerId: playerId,
-                        roomId: data.roomId,
-                        gameData: room.gameData,
-                        players: existingPlayers
-                    }));
-                    
-                    room.players.forEach((playerWs, pid) => {
-                        if (pid !== playerId) {
-                            playerWs.send(JSON.stringify({
-                                type: 'player_joined',
-                                playerId: playerId,
-                                position: { x: 0, y: 1.5, z: 0 }
-                            }));
-                        }
-                    });
-                    
-                    console.log(`👋 Игрок ${playerId} вошёл в комнату ${data.roomId} (${room.players.size} игроков)`);
+                    joinRoom(ws, data.roomId);
                     break;
-                
+                    
                 case 'update_position':
-                    if (currentRoomId) {
-                        const currentRoom = rooms.get(currentRoomId);
-                        if (currentRoom) {
-                            currentRoom.players.forEach((playerWs, pid) => {
-                                if (pid !== playerId && playerWs.readyState === WebSocket.OPEN) {
-                                    playerWs.send(JSON.stringify({
-                                        type: 'player_moved',
-                                        playerId: playerId,
-                                        position: data.position
-                                    }));
-                                }
-                            });
+                    if (ws.roomId && ws.playerId) {
+                        const room = rooms.get(ws.roomId);
+                        if (room && room.players.has(ws.playerId)) {
+                            room.players.get(ws.playerId).position = data.position;
+                            // Рассылаем всем ОСТАЛЬНЫМ игрокам
+                            broadcastToRoom(ws.roomId, {
+                                type: 'player_moved',
+                                playerId: ws.playerId,
+                                position: data.position
+                            }, ws.playerId);
                         }
                     }
                     break;
-                
+                    
                 case 'leave_room':
-                    if (currentRoomId) {
-                        const currentRoom = rooms.get(currentRoomId);
-                        if (currentRoom) {
-                            currentRoom.players.delete(playerId);
-                            currentRoom.players.forEach((playerWs) => {
-                                if (playerWs.readyState === WebSocket.OPEN) {
-                                    playerWs.send(JSON.stringify({ type: 'player_left', playerId: playerId }));
-                                }
-                            });
-                            if (currentRoom.players.size === 0) {
-                                rooms.delete(currentRoomId);
-                                console.log(`🗑️ Комната ${currentRoomId} удалена (нет игроков)`);
-                            }
-                        }
-                        currentRoomId = null;
-                    }
+                    leaveRoom(ws);
                     break;
             }
-        } catch (err) { console.error('Ошибка:', err); }
-    });
-    
-    ws.on('close', () => {
-        console.log(`❌ Игрок ${playerId} отключился`);
-        if (currentRoomId) {
-            const room = rooms.get(currentRoomId);
-            if (room) {
-                room.players.delete(playerId);
-                room.players.forEach((playerWs) => {
-                    if (playerWs.readyState === WebSocket.OPEN) {
-                        playerWs.send(JSON.stringify({ type: 'player_left', playerId: playerId }));
-                    }
-                });
-                if (room.players.size === 0) {
-                    rooms.delete(currentRoomId);
-                    console.log(`🗑️ Комната ${currentRoomId} удалена (нет игроков)`);
-                }
-            }
+        } catch (e) {
+            console.error('Ошибка парсинга:', e);
         }
     });
 
-    ws.on('error', (err) => console.error(`Ошибка WebSocket игрока ${playerId}:`, err));
+    ws.on('close', () => leaveRoom(ws));
 });
 
-const interval = setInterval(() => {
-    server.clients.forEach((ws) => {
-        if (ws.isAlive === false) return ws.terminate();
-        ws.isAlive = false;
-        ws.ping();
+function joinRoom(ws, roomId) {
+    if (!rooms.has(roomId)) {
+        rooms.set(roomId, { id: roomId, players: new Map() });
+    }
+    
+    const room = rooms.get(roomId);
+    const playerId = generateId();
+    
+    // СОХРАНЯЕМ САМ WEBSOCKET (ws) вместе с игроком! Это и было ошибкой.
+    room.players.set(playerId, { ws, position: { x: 0, y: 5, z: 0 } });
+    
+    ws.roomId = roomId;
+    ws.playerId = playerId;
+    
+    // Отправляем данные новому игроку
+    ws.send(JSON.stringify({
+        type: 'joined_room',
+        roomId: roomId,
+        playerId: playerId,
+        gameData: room.gameData,
+        players: Array.from(room.players.entries())
+            .filter(([id]) => id !== playerId)
+            .map(([id, p]) => ({ id, position: p.position }))
+    }));
+    
+    // Сообщаем ОСТАЛЬНЫМ, что зашел новый игрок
+    broadcastToRoom(roomId, {
+        type: 'player_joined',
+        playerId: playerId,
+        position: { x: 0, y: 5, z: 0 }
+    }, playerId);
+}
+
+function leaveRoom(ws) {
+    if (!ws.roomId || !ws.playerId) return;
+    const room = rooms.get(ws.roomId);
+    if (room) {
+        room.players.delete(ws.playerId);
+        broadcastToRoom(ws.roomId, {
+            type: 'player_left',
+            playerId: ws.playerId
+        }, ws.playerId);
+        
+        if (room.players.size === 0) {
+            rooms.delete(ws.roomId);
+        }
+    }
+    ws.roomId = null;
+    ws.playerId = null;
+}
+
+function broadcastToRoom(roomId, message, excludeId = null) {
+    const room = rooms.get(roomId);
+    if (!room) return;
+    const msgStr = JSON.stringify(message);
+    
+    room.players.forEach((player, id) => {
+        if (id !== excludeId && player.ws.readyState === WebSocket.OPEN) {
+            player.ws.send(msgStr); // Отправляем через сохраненный ws
+        }
     });
-}, 30000);
+}
 
-server.on('close', () => clearInterval(interval));
+function generateId() {
+    return Math.random().toString(36).substring(2, 10);
+}
 
-console.log(`🚀 Сигнальный сервер на порту ${process.env.PORT || 8080}`);
+console.log(`WebSocket сервер запущен на порту ${port}`);
